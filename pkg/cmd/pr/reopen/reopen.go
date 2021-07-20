@@ -5,20 +5,17 @@ import (
 	"net/http"
 
 	"github.com/cli/cli/api"
-	"github.com/cli/cli/internal/config"
-	"github.com/cli/cli/internal/ghrepo"
 	"github.com/cli/cli/pkg/cmd/pr/shared"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
 
 type ReopenOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
 	IO         *iostreams.IOStreams
-	BaseRepo   func() (ghrepo.Interface, error)
+
+	Finder shared.PRFinder
 
 	SelectorArg string
 }
@@ -27,7 +24,6 @@ func NewCmdReopen(f *cmdutil.Factory, runF func(*ReopenOptions) error) *cobra.Co
 	opts := &ReopenOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
-		Config:     f.Config,
 	}
 
 	cmd := &cobra.Command{
@@ -35,8 +31,7 @@ func NewCmdReopen(f *cmdutil.Factory, runF func(*ReopenOptions) error) *cobra.Co
 		Short: "Reopen a pull request",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
-			opts.BaseRepo = f.BaseRepo
+			opts.Finder = shared.NewFinder(f)
 
 			if len(args) > 0 {
 				opts.SelectorArg = args[0]
@@ -53,33 +48,39 @@ func NewCmdReopen(f *cmdutil.Factory, runF func(*ReopenOptions) error) *cobra.Co
 }
 
 func reopenRun(opts *ReopenOptions) error {
+	cs := opts.IO.ColorScheme()
+
+	findOptions := shared.FindOptions{
+		Selector: opts.SelectorArg,
+		Fields:   []string{"id", "number", "state", "title"},
+	}
+	pr, baseRepo, err := opts.Finder.Find(findOptions)
+	if err != nil {
+		return err
+	}
+
+	if pr.State == "MERGED" {
+		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) can't be reopened because it was already merged\n", cs.FailureIcon(), pr.Number, pr.Title)
+		return cmdutil.SilentError
+	}
+
+	if pr.IsOpen() {
+		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) is already open\n", cs.WarningIcon(), pr.Number, pr.Title)
+		return nil
+	}
+
 	httpClient, err := opts.HttpClient()
 	if err != nil {
 		return err
 	}
 	apiClient := api.NewClientFromHTTP(httpClient)
 
-	pr, baseRepo, err := shared.PRFromArgs(apiClient, opts.BaseRepo, nil, nil, opts.SelectorArg)
-	if err != nil {
-		return err
-	}
-
-	if pr.State == "MERGED" {
-		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) can't be reopened because it was already merged", utils.Red("!"), pr.Number, pr.Title)
-		return cmdutil.SilentError
-	}
-
-	if !pr.Closed {
-		fmt.Fprintf(opts.IO.ErrOut, "%s Pull request #%d (%s) is already open\n", utils.Yellow("!"), pr.Number, pr.Title)
-		return nil
-	}
-
 	err = api.PullRequestReopen(apiClient, baseRepo, pr)
 	if err != nil {
 		return fmt.Errorf("API call failed: %w", err)
 	}
 
-	fmt.Fprintf(opts.IO.ErrOut, "%s Reopened pull request #%d (%s)\n", utils.Green("✔"), pr.Number, pr.Title)
+	fmt.Fprintf(opts.IO.ErrOut, "%s Reopened pull request #%d (%s)\n", cs.SuccessIconWithColor(cs.Green), pr.Number, pr.Title)
 
 	return nil
 }
